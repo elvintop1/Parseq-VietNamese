@@ -1,0 +1,1 @@
+python format_result_file.py prediction.txt prediction.txt
