@@ -1,3 +1,5 @@
+
+# %load /kaggle/working/Parseq-Vietnamese/strhub/models/base.py
 # Scene Text Recognition Model Hub
 # Copyright 2022 Darwin Bautista
 #
@@ -16,17 +18,17 @@
 import math
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Optional, Tuple, List
+from typing import List, Dict, Any, Optional, Tuple
 
 import pytorch_lightning as pl
 import torch
 import torch.nn.functional as F
 from nltk import edit_distance
-from pytorch_lightning.utilities.types import EPOCH_OUTPUT, STEP_OUTPUT
+from typing import List, Dict, Any
 from timm.optim import create_optimizer_v2
 from torch import Tensor
 from torch.optim import Optimizer
-from torch.optim.lr_scheduler import OneCycleLR
+from torch.optim.lr_scheduler import CosineAnnealingLR
 
 from strhub.data.utils import CharsetAdapter, CTCTokenizer, Tokenizer, BaseTokenizer
 
@@ -53,6 +55,7 @@ class BaseSystem(pl.LightningModule, ABC):
         self.lr = lr
         self.warmup_pct = warmup_pct
         self.weight_decay = weight_decay
+        self.outputs = []
 
     @abstractmethod
     def forward(self, images: Tensor, max_length: Optional[int] = None) -> Tensor:
@@ -87,15 +90,22 @@ class BaseSystem(pl.LightningModule, ABC):
         # Linear scaling so that the effective learning rate is constant regardless of the number of GPUs used with DDP.
         lr_scale = agb * math.sqrt(self.trainer.num_devices) * self.batch_size / 256.
         lr = lr_scale * self.lr
+        
         optim = create_optimizer_v2(self, 'adamw', lr, self.weight_decay)
-        sched = OneCycleLR(optim, lr, self.trainer.estimated_stepping_batches, pct_start=self.warmup_pct,
-                           cycle_momentum=False)
-        return {'optimizer': optim, 'lr_scheduler': {'scheduler': sched, 'interval': 'step'}}
+        sched = CosineAnnealingLR(optim, T_max=self.trainer.max_epochs)
+        return {
+            "optimizer": optim,
+            "lr_scheduler": {
+                "scheduler": sched,
+                "interval": "epoch",
+                "frequency": 1
+            }
+        }
 
-    def optimizer_zero_grad(self, epoch: int, batch_idx: int, optimizer: Optimizer, optimizer_idx: int):
+    def optimizer_zero_grad(self, epoch: int, batch_idx: int, optimizer: Optimizer):
         optimizer.zero_grad(set_to_none=True)
 
-    def _eval_step(self, batch, validation: bool) -> Optional[STEP_OUTPUT]:
+    def _eval_step(self, batch, validation: bool) -> Optional[Dict[str, Any]]:
         images, labels = batch
 
         correct = 0
@@ -129,7 +139,7 @@ class BaseSystem(pl.LightningModule, ABC):
         return dict(output=BatchResult(total, correct, ned, confidence, label_length, loss, loss_numel))
 
     @staticmethod
-    def _aggregate_results(outputs: EPOCH_OUTPUT) -> Tuple[float, float, float]:
+    def _aggregate_results(outputs: List[Dict[str, Any]]) -> Tuple[float, float, float]:
         if not outputs:
             return 0., 0., 0.
         total_loss = 0
@@ -149,17 +159,20 @@ class BaseSystem(pl.LightningModule, ABC):
         loss = total_loss / total_loss_numel
         return acc, ned, loss
 
-    def validation_step(self, batch, batch_idx) -> Optional[STEP_OUTPUT]:
-        return self._eval_step(batch, True)
+    def validation_step(self, batch, batch_idx) -> Optional[Dict[str, Any]]:
+        result = self._eval_step(batch, True)
+        self.outputs.append(result)
+        return result
 
-    def validation_epoch_end(self, outputs: EPOCH_OUTPUT) -> None:
-        acc, ned, loss = self._aggregate_results(outputs)
+    def on_validation_epoch_end(self) -> None:
+        acc, ned, loss = self._aggregate_results(self.outputs)
+        self.outputs.clear()
         self.log('val_accuracy', 100 * acc, sync_dist=True)
         self.log('val_NED', 100 * ned, sync_dist=True)
         self.log('val_loss', loss, sync_dist=True)
         self.log('hp_metric', acc, sync_dist=True)
 
-    def test_step(self, batch, batch_idx) -> Optional[STEP_OUTPUT]:
+    def test_step(self, batch, batch_idx) -> Optional[Dict[str, Any]]:
         return self._eval_step(batch, False)
 
 
